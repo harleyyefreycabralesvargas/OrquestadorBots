@@ -10,7 +10,7 @@ uvicorn[standard]==0.32.1
 
 # Base de datos MongoDB async
 motor==3.6.0
-pymongo==4.10.1
+pymongo>=4.9,<4.10
 
 # Validación y modelos
 pydantic==2.10.3
