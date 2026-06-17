@@ -1,0 +1,88 @@
+# render.yaml — Configuración de despliegue Render.com (v3.0)
+# Colocar en la raíz del repositorio de la API
+# Documentación: https://render.com/docs/blueprint-spec
+
+services:
+  # ── API Central ──
+  - type: web
+    name: rpa-cajasan-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements_api.txt
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT --workers 1
+    envVars:
+      - key: MONGO_URL
+        sync: false
+      - key: JWT_SECRET_MASTER
+        sync: false
+      - key: JWT_SECRET_WORKER
+        sync: false
+      - key: FERNET_KEY
+        sync: false
+      - key: MASTER_USERNAME
+        sync: false
+      - key: MASTER_PASSWORD_HASH
+        sync: false
+      - key: MAX_LOG_SIZE_MB
+        value: "20"
+      - key: GIT_CLONE_TIMEOUT
+        value: "120"
+      - key: PIP_INSTALL_TIMEOUT
+        value: "300"
+      - key: TASK_EXECUTION_TIMEOUT
+        value: "3600"
+      - key: WORKER_TIMEOUT_SECONDS
+        value: "120"
+      - key: JWT_EXPIRY_HOURS
+        value: "24"
+      - key: WEBHOOK_TIMEOUT
+        value: "10"
+      # SMTP (opcional) — definir en el dashboard si se usan alertas por correo
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+      - key: SMTP_TLS
+        value: "true"
+    healthCheckPath: /health
+    autoDeploy: true
+
+# ════════════════════════════════════════════════════════════
+# CRON JOB — Disparador de Schedules (v3.0)
+# ════════════════════════════════════════════════════════════
+# Los schedules CRON requieren un disparo externo periódico.
+# Este Cron Job llama a POST /api/schedules/tick cada minuto.
+#
+# IMPORTANTE: reemplazar RPA_API_KEY por una API Key generada en la
+# sección "🔑 API Keys" de la interfaz (empieza por rpak_), y
+# RPA_API_URL por la URL pública de la API en Render.
+#
+# Nota: el plan free de Render NO incluye cron jobs. Alternativas:
+#   - Usar un servicio externo de cron (cron-job.org, EasyCron, UptimeRobot)
+#     que haga POST a https://TU-API.onrender.com/api/schedules/tick
+#     con header Authorization: Bearer rpak_xxx
+#   - O actualizar el plan de Render para habilitar cronjobs.
+# ════════════════════════════════════════════════════════════
+#
+# jobs:
+#   - type: cron
+#     name: rpa-schedules-tick
+#     runtime: python
+#     plan: starter            # los cron jobs requieren plan de pago
+#     schedule: "* * * * *"    # cada minuto
+#     buildCommand: pip install httpx
+#     startCommand: >
+#       python -c "import httpx,os;
+#       httpx.post(os.environ['RPA_API_URL'] + '/api/schedules/tick',
+#       headers={'Authorization': 'Bearer ' + os.environ['RPA_API_KEY']}, timeout=30)"
+#     envVars:
+#       - key: RPA_API_URL
+#         sync: false
+#       - key: RPA_API_KEY
+#         sync: false
