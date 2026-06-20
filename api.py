@@ -49,9 +49,9 @@ import bcrypt
 import jwt
 from bson import ObjectId
 from cryptography.fernet import Fernet
-from fastapi import Depends, FastAPI, HTTPException, Security, Query
+from fastapi import Depends, FastAPI, HTTPException, Security, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from pydantic import BaseModel, Field, field_validator
@@ -145,6 +145,15 @@ async def lifespan(app: FastAPI):
     await _db["pools"].create_index("nombre", unique=True)
     await _db["plantillas"].create_index("nombre", unique=True)
     await _db["config_global"].create_index("_id")
+    # v3.5: usuarios master + biblioteca de archivos
+    await _db["usuarios_master"].create_index("username", unique=True)
+    await _db["biblioteca_archivos"].create_index([("fecha_creacion", DESCENDING)])
+    # TTL: auditoría y notificaciones se autolimpian a los 90 días (evita llenar Atlas free)
+    try:
+        await _db["audit_log"].create_index("ts_dt", expireAfterSeconds=90 * 24 * 3600)
+        await _db["notificaciones"].create_index("ts_dt", expireAfterSeconds=90 * 24 * 3600)
+    except Exception as _e:
+        logger.warning(f"No se pudo crear índice TTL: {_e}")
 
     # Config global por defecto
     cfg = await _db["config_global"].find_one({"_id": "global"})
@@ -175,13 +184,51 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+_origins_env = os.getenv("ALLOWED_ORIGINS", "*").strip()
+_allowed_origins = ["*"] if _origins_env == "*" else [o.strip() for o in _origins_env.split(",") if o.strip()]
+_allow_creds = _allowed_origins != ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_allowed_origins,
+    allow_credentials=_allow_creds,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _seguridad_y_roles(request: Request, call_next):
+    """Control de roles por método/ruta + cabeceras de seguridad."""
+    metodo = request.method
+    path = request.url.path
+    libres = path in ("/health", "/", "/docs", "/redoc", "/openapi.json") \
+        or path.startswith("/api/auth/") or path.startswith("/api/worker/")
+
+    if not libres and metodo in ("POST", "PUT", "PATCH", "DELETE"):
+        auth = request.headers.get("authorization", "")
+        if auth.startswith("Bearer "):
+            tok = auth[7:]
+            if not tok.startswith("rpak_"):
+                try:
+                    payload = jwt.decode(tok, JWT_SECRET_MASTER, algorithms=["HS256"],
+                                         options={"verify_exp": False})
+                    rol = payload.get("rol", "admin")
+                    if rol == "visor":
+                        return JSONResponse(status_code=403,
+                                            content={"detail": "Tu rol (visor) es de solo lectura."})
+                    if rol != "admin" and path.startswith("/api/usuarios"):
+                        return JSONResponse(status_code=403,
+                                            content={"detail": "Solo un administrador puede gestionar usuarios."})
+                except Exception:
+                    pass
+
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    return response
+
 
 security = HTTPBearer()
 
@@ -194,6 +241,7 @@ def _create_jwt(payload: dict, secret: str, hours: int = JWT_EXPIRY_HOURS) -> st
     payload = payload.copy()
     payload["exp"] = datetime.now(timezone.utc) + timedelta(hours=hours)
     payload["iat"] = datetime.now(timezone.utc)
+    payload["jti"] = secrets.token_hex(16)  # id único del token (para revocación)
     return jwt.encode(payload, secret, algorithm="HS256")
 
 
@@ -204,6 +252,47 @@ def _decode_jwt(token: str, secret: str) -> dict:
         raise HTTPException(status_code=401, detail="Token expirado")
     except jwt.InvalidTokenError as e:
         raise HTTPException(status_code=401, detail=f"Token inválido: {e}")
+
+
+# ── Revocación de tokens (logout) — en memoria ──
+_TOKENS_REVOCADOS: set[str] = set()
+
+# ── Rate limiting / bloqueo por intentos fallidos de login — en memoria ──
+_INTENTOS_LOGIN: dict[str, list[float]] = {}        # clave -> timestamps de intentos
+_BLOQUEOS_LOGIN: dict[str, float] = {}              # clave -> timestamp hasta el que está bloqueada
+RATE_MAX_INTENTOS = int(os.getenv("RATE_MAX_INTENTOS", "5"))      # intentos permitidos
+RATE_VENTANA_SEG = int(os.getenv("RATE_VENTANA_SEG", "300"))      # ventana de conteo (5 min)
+RATE_BLOQUEO_SEG = int(os.getenv("RATE_BLOQUEO_SEG", "900"))      # duración del bloqueo (15 min)
+
+
+def _rate_check(clave: str) -> Optional[int]:
+    """Devuelve segundos restantes de bloqueo si la clave está bloqueada, o None si puede intentar."""
+    import time as _t
+    ahora = _t.time()
+    hasta = _BLOQUEOS_LOGIN.get(clave)
+    if hasta and ahora < hasta:
+        return int(hasta - ahora)
+    if hasta and ahora >= hasta:
+        _BLOQUEOS_LOGIN.pop(clave, None)
+        _INTENTOS_LOGIN.pop(clave, None)
+    return None
+
+
+def _rate_fallo(clave: str) -> None:
+    """Registra un intento fallido; bloquea si supera el máximo en la ventana."""
+    import time as _t
+    ahora = _t.time()
+    intentos = [t for t in _INTENTOS_LOGIN.get(clave, []) if ahora - t < RATE_VENTANA_SEG]
+    intentos.append(ahora)
+    _INTENTOS_LOGIN[clave] = intentos
+    if len(intentos) >= RATE_MAX_INTENTOS:
+        _BLOQUEOS_LOGIN[clave] = ahora + RATE_BLOQUEO_SEG
+
+
+def _rate_exito(clave: str) -> None:
+    """Limpia el contador tras un login exitoso."""
+    _INTENTOS_LOGIN.pop(clave, None)
+    _BLOQUEOS_LOGIN.pop(clave, None)
 
 
 async def _verify_master(credentials: HTTPAuthorizationCredentials = Security(security)) -> dict:
@@ -219,11 +308,21 @@ async def _verify_master(credentials: HTTPAuthorizationCredentials = Security(se
         await db["api_keys"].update_one(
             {"_id": doc["_id"]}, {"$set": {"ultima_uso": _now_iso()}}
         )
-        return {"sub": doc.get("nombre", "apikey"), "role": "master", "via": "apikey"}
+        return {"sub": doc.get("nombre", "apikey"), "role": "master", "rol": "admin", "via": "apikey"}
     # JWT
     payload = _decode_jwt(token, JWT_SECRET_MASTER)
     if payload.get("role") != "master":
         raise HTTPException(status_code=403, detail="Acceso restringido a Master")
+    if payload.get("jti") in _TOKENS_REVOCADOS:
+        raise HTTPException(status_code=401, detail="Sesión cerrada. Vuelve a iniciar sesión.")
+    payload.setdefault("rol", "admin")  # compat: tokens viejos sin rol = admin
+    return payload
+
+
+async def _verify_admin(payload: dict = Depends(_verify_master)) -> dict:
+    """Restringe a usuarios con rol 'admin'."""
+    if payload.get("rol") != "admin":
+        raise HTTPException(status_code=403, detail="Acción reservada a administradores")
     return payload
 
 
@@ -260,7 +359,7 @@ async def _audit(db: AsyncIOMotorDatabase, usuario: str, accion: str, recurso: s
     """Registra una acción en el log de auditoría."""
     try:
         await db["audit_log"].insert_one({
-            "ts": _now_iso(), "usuario": usuario,
+            "ts": _now_iso(), "ts_dt": _now_dt(), "usuario": usuario,
             "accion": accion, "recurso": recurso, "detalle": detalle,
         })
     except Exception as e:
@@ -272,7 +371,7 @@ async def _notificar(db: AsyncIOMotorDatabase, tipo: str, mensaje: str, severida
     try:
         await db["notificaciones"].insert_one({
             "id_notif": str(uuid.uuid4()),
-            "ts": _now_iso(), "tipo": tipo,
+            "ts": _now_iso(), "ts_dt": _now_dt(), "tipo": tipo,
             "mensaje": mensaje, "severidad": severidad, "leida": False,
         })
     except Exception as e:
@@ -622,15 +721,45 @@ class WorkerInfo(BaseModel):
     ram_percent: Optional[float] = None
     disk_percent: Optional[float] = None
 
+class ArchivoAdjunto(BaseModel):
+    """Archivo de configuración inyectado en el repo del robot antes de ejecutar.
+    Permite que el robot reciba config.json, settings.yaml, cuentas.txt, etc.,
+    con el nombre y la ruta que necesite, sin pasar por GitHub."""
+    nombre_archivo: str = Field(..., min_length=1, max_length=200,
+                                description="Nombre exacto que tendrá en el repo, ej. config.json")
+    contenido: str = Field(default="", description="Contenido (texto o base64). Cifrado si 'encriptado'=True")
+    encriptado: bool = Field(default=False, description="Si True, 'contenido' viene cifrado con Fernet")
+    es_binario: bool = Field(default=False, description="Si True, 'contenido' es base64 de un binario")
+    subcarpeta: str = Field(default="", max_length=200,
+                            description="Subcarpeta dentro del repo, ej. config/ (opcional)")
+
+    @field_validator("nombre_archivo")
+    @classmethod
+    def _val_nombre(cls, v: str) -> str:
+        v = v.strip().replace("\\", "/")
+        if v.startswith("/") or ".." in v:
+            raise ValueError("Nombre de archivo inválido (sin rutas absolutas ni '..')")
+        return v
+
+    @field_validator("subcarpeta")
+    @classmethod
+    def _val_sub(cls, v: str) -> str:
+        v = (v or "").strip().replace("\\", "/").strip("/")
+        if ".." in v:
+            raise ValueError("Subcarpeta inválida")
+        return v
+
+
 class CrearProyectoRequest(BaseModel):
     nombre: str = Field(..., min_length=2, max_length=100)
     descripcion: str = Field(..., min_length=5)
     git_url: str
     archivo_principal: str = Field(..., min_length=1)
-    archivo_requirements: str = Field(default="requirements.txt")
+    archivo_requirements: str = Field(default="")
     tags: list[str] = Field(default_factory=list)
     env_vars: dict[str, str] = Field(default_factory=dict)
     git_ref: Optional[str] = Field(default=None, description="Rama, tag o commit por defecto")
+    archivos_adjuntos: list[ArchivoAdjunto] = Field(default_factory=list)
 
     @field_validator("git_url")
     @classmethod
@@ -648,6 +777,7 @@ class ActualizarProyectoRequest(BaseModel):
     tags: Optional[list[str]] = None
     env_vars: Optional[dict[str, str]] = None
     git_ref: Optional[str] = None
+    archivos_adjuntos: Optional[list[ArchivoAdjunto]] = None
 
     @field_validator("git_url")
     @classmethod
@@ -668,6 +798,7 @@ class ProyectoInfo(BaseModel):
     tags: list[str] = []
     env_vars: dict[str, str] = {}
     git_ref: Optional[str] = None
+    archivos_adjuntos: list[ArchivoAdjunto] = []
     fecha_creacion: str
 
 class LanzarTareaRequest(BaseModel):
@@ -682,6 +813,8 @@ class LanzarTareaRequest(BaseModel):
     git_ref: Optional[str] = None
     env_override: dict[str, str] = Field(default_factory=dict)
     sla_segundos: int = Field(default=0, ge=0, description="0 = sin límite")
+    timeout_segundos: int = Field(default=0, ge=0, le=86400, description="Máx. ejecución (0 = usa default worker)")
+    archivos_adjuntos: list[ArchivoAdjunto] = Field(default_factory=list)
 
 class LanzarAutoRequest(BaseModel):
     id_proyecto: str
@@ -694,6 +827,8 @@ class LanzarAutoRequest(BaseModel):
     git_ref: Optional[str] = None
     env_override: dict[str, str] = Field(default_factory=dict)
     sla_segundos: int = Field(default=0, ge=0)
+    timeout_segundos: int = Field(default=0, ge=0, le=86400)
+    archivos_adjuntos: list[ArchivoAdjunto] = Field(default_factory=list)
 
 class TareaInfo(BaseModel):
     id_tarea: str
@@ -711,6 +846,8 @@ class TareaInfo(BaseModel):
     depende_de: list[str] = []
     git_ref: Optional[str] = None
     sla_segundos: int = 0
+    timeout_segundos: int = 0
+    num_archivos_adjuntos: int = 0
     fecha_creacion: str
     fecha_inicio: Optional[str] = None
     fecha_fin: Optional[str] = None
@@ -743,6 +880,8 @@ class ObtenerTareaResponse(BaseModel):
     archivo_requirements: Optional[str] = None
     credenciales_encriptadas: Optional[str] = None
     env_vars: dict[str, str] = {}
+    archivos_adjuntos: list[ArchivoAdjunto] = []
+    timeout_segundos: int = 0
 
 class ComandoTareaRequest(BaseModel):
     comando: str
@@ -916,14 +1055,69 @@ class PlantillaInfo(BaseModel):
 # ─────────────────────────────────────────────
 
 @app.post("/api/auth/master", response_model=MasterLoginResponse, tags=["Auth"])
-async def login_master(body: MasterLoginRequest, db: AsyncIOMotorDatabase = Depends(get_db)) -> MasterLoginResponse:
-    if body.username != MASTER_USERNAME:
+async def login_master(body: MasterLoginRequest, request: Request,
+                       db: AsyncIOMotorDatabase = Depends(get_db)) -> MasterLoginResponse:
+    # Rate limiting / bloqueo por intentos fallidos (por IP + usuario)
+    ip = request.client.host if request.client else "?"
+    clave = f"{ip}:{body.username}"
+    bloqueo = _rate_check(clave)
+    if bloqueo is not None:
+        raise HTTPException(status_code=429,
+                            detail=f"Demasiados intentos fallidos. Intenta de nuevo en {bloqueo // 60 + 1} min.")
+
+    nombre = body.username
+    rol = "admin"
+    autenticado = False
+
+    # 1) Superadmin de variables de entorno (bootstrap, siempre rol admin)
+    if body.username == MASTER_USERNAME and bcrypt.checkpw(body.password.encode(), MASTER_PASSWORD_HASH.encode()):
+        autenticado = True
+        rol = "admin"
+        nombre = MASTER_USERNAME
+    else:
+        # 2) Usuarios de la colección usuarios_master
+        u = await db["usuarios_master"].find_one({"username": body.username, "activo": True})
+        if u and bcrypt.checkpw(body.password.encode(), u["password_hash"].encode()):
+            autenticado = True
+            rol = u.get("rol", "operador")
+            nombre = u.get("nombre_completo") or u["username"]
+            await db["usuarios_master"].update_one({"_id": u["_id"]}, {"$set": {"ultimo_acceso": _now_iso()}})
+
+    if not autenticado:
+        _rate_fallo(clave)
+        await _audit(db, body.username, "login_fallido", "auth", f"Intento fallido desde {ip}")
         raise HTTPException(status_code=401, detail="Credenciales inválidas")
-    if not bcrypt.checkpw(body.password.encode(), MASTER_PASSWORD_HASH.encode()):
-        raise HTTPException(status_code=401, detail="Credenciales inválidas")
-    token = _create_jwt({"sub": body.username, "role": "master"}, JWT_SECRET_MASTER)
-    await _audit(db, body.username, "login", "auth", "Inicio de sesión Master")
+
+    _rate_exito(clave)
+    token = _create_jwt({"sub": body.username, "role": "master", "rol": rol, "nombre": nombre}, JWT_SECRET_MASTER)
+    await _audit(db, body.username, "login", "auth", f"Inicio de sesión ({rol})")
     return MasterLoginResponse(access_token=token)
+
+
+@app.get("/api/auth/me", tags=["Auth"])
+async def auth_me(payload: dict = Depends(_verify_master)) -> dict[str, Any]:
+    """Devuelve la identidad y permisos del usuario autenticado."""
+    rol = payload.get("rol", "admin")
+    return {
+        "username": payload.get("sub"),
+        "nombre": payload.get("nombre") or payload.get("sub"),
+        "rol": rol,
+        "puede_escribir": rol in ("admin", "operador"),
+        "es_admin": rol == "admin",
+        "via": payload.get("via", "jwt"),
+    }
+
+
+@app.post("/api/auth/logout", tags=["Auth"])
+async def logout(payload: dict = Depends(_verify_master)) -> dict[str, str]:
+    """Revoca el token actual (cierre de sesión seguro)."""
+    jti = payload.get("jti")
+    if jti:
+        _TOKENS_REVOCADOS.add(jti)
+        # Evitar crecimiento ilimitado del set
+        if len(_TOKENS_REVOCADOS) > 10000:
+            _TOKENS_REVOCADOS.clear()
+    return {"mensaje": "Sesión cerrada correctamente"}
 
 
 @app.post("/api/auth/worker", response_model=WorkerLoginResponse, tags=["Auth"])
@@ -937,6 +1131,156 @@ async def login_worker(body: WorkerLoginRequest, db: AsyncIOMotorDatabase = Depe
     worker_id = str(worker["_id"])
     token = _create_jwt({"sub": body.username, "role": "worker", "worker_id": worker_id}, JWT_SECRET_WORKER)
     return WorkerLoginResponse(access_token=token, worker_id=worker_id)
+
+
+# ─────────────────────────────────────────────
+# GESTIÓN DE USUARIOS (multiusuario con roles)
+# ─────────────────────────────────────────────
+
+ROLES_VALIDOS = ["admin", "operador", "visor"]
+
+
+class CrearUsuarioRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=8, max_length=200)
+    nombre_completo: Optional[str] = Field(default=None, max_length=120)
+    rol: str = Field(default="operador")
+
+    @field_validator("username")
+    @classmethod
+    def _val_user(cls, v: str) -> str:
+        v = v.strip().lower()
+        if not v.replace("_", "").replace(".", "").isalnum():
+            raise ValueError("El usuario solo admite letras, números, '_' y '.'")
+        return v
+
+    @field_validator("rol")
+    @classmethod
+    def _val_rol(cls, v: str) -> str:
+        if v not in ROLES_VALIDOS:
+            raise ValueError(f"Rol inválido. Debe ser uno de: {', '.join(ROLES_VALIDOS)}")
+        return v
+
+
+class ActualizarUsuarioRequest(BaseModel):
+    nombre_completo: Optional[str] = None
+    rol: Optional[str] = None
+    activo: Optional[bool] = None
+
+    @field_validator("rol")
+    @classmethod
+    def _val_rol(cls, v):
+        if v is not None and v not in ROLES_VALIDOS:
+            raise ValueError(f"Rol inválido. Debe ser uno de: {', '.join(ROLES_VALIDOS)}")
+        return v
+
+
+class CambiarPasswordUsuarioRequest(BaseModel):
+    nueva_password: str = Field(..., min_length=8, max_length=200)
+
+
+class UsuarioInfo(BaseModel):
+    id: str
+    username: str
+    nombre_completo: Optional[str] = None
+    rol: str
+    activo: bool
+    fecha_creacion: str
+    ultimo_acceso: Optional[str] = None
+
+
+def _usuario_info(u: dict) -> UsuarioInfo:
+    return UsuarioInfo(
+        id=str(u["_id"]), username=u["username"], nombre_completo=u.get("nombre_completo"),
+        rol=u.get("rol", "operador"), activo=u.get("activo", True),
+        fecha_creacion=u["fecha_creacion"], ultimo_acceso=u.get("ultimo_acceso"),
+    )
+
+
+@app.post("/api/usuarios", response_model=UsuarioInfo, tags=["Usuarios"])
+async def crear_usuario(body: CrearUsuarioRequest, db: AsyncIOMotorDatabase = Depends(get_db),
+                        admin: dict = Depends(_verify_admin)) -> UsuarioInfo:
+    if body.username == MASTER_USERNAME:
+        raise HTTPException(status_code=400, detail="Ese usuario está reservado al superadmin")
+    existe = await db["usuarios_master"].find_one({"username": body.username})
+    if existe:
+        raise HTTPException(status_code=409, detail="Ya existe un usuario con ese nombre")
+    ahora = _now_iso()
+    pwd_hash = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
+    doc = {
+        "_id": ObjectId(), "username": body.username, "password_hash": pwd_hash,
+        "nombre_completo": body.nombre_completo, "rol": body.rol, "activo": True,
+        "fecha_creacion": ahora, "ultimo_acceso": None,
+    }
+    await db["usuarios_master"].insert_one(doc)
+    await _audit(db, admin.get("sub", "?"), "crear_usuario", body.username, f"Rol: {body.rol}")
+    return _usuario_info(doc)
+
+
+@app.get("/api/usuarios", tags=["Usuarios"])
+async def listar_usuarios(db: AsyncIOMotorDatabase = Depends(get_db),
+                          admin: dict = Depends(_verify_admin)) -> list[dict]:
+    out = []
+    # Incluir el superadmin de entorno como entrada virtual (no editable)
+    out.append({
+        "id": "__env__", "username": MASTER_USERNAME, "nombre_completo": "Superadministrador (variables de entorno)",
+        "rol": "admin", "activo": True, "fecha_creacion": "—", "ultimo_acceso": None, "protegido": True,
+    })
+    async for u in db["usuarios_master"].find().sort("fecha_creacion", DESCENDING):
+        d = _usuario_info(u).model_dump()
+        d["protegido"] = False
+        out.append(d)
+    return out
+
+
+@app.patch("/api/usuarios/{usuario_id}", response_model=UsuarioInfo, tags=["Usuarios"])
+async def actualizar_usuario(usuario_id: str, body: ActualizarUsuarioRequest,
+                             db: AsyncIOMotorDatabase = Depends(get_db),
+                             admin: dict = Depends(_verify_admin)) -> UsuarioInfo:
+    try:
+        oid = ObjectId(usuario_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="usuario_id inválido")
+    campos = {f: getattr(body, f) for f in ["nombre_completo", "rol", "activo"] if getattr(body, f) is not None}
+    if not campos:
+        raise HTTPException(status_code=400, detail="Nada que actualizar")
+    u = await db["usuarios_master"].find_one_and_update(
+        {"_id": oid}, {"$set": campos}, return_document=ReturnDocument.AFTER)
+    if not u:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    await _audit(db, admin.get("sub", "?"), "actualizar_usuario", u["username"], str(campos))
+    return _usuario_info(u)
+
+
+@app.post("/api/usuarios/{usuario_id}/password", tags=["Usuarios"])
+async def cambiar_password_usuario(usuario_id: str, body: CambiarPasswordUsuarioRequest,
+                                   db: AsyncIOMotorDatabase = Depends(get_db),
+                                   admin: dict = Depends(_verify_admin)) -> dict[str, str]:
+    try:
+        oid = ObjectId(usuario_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="usuario_id inválido")
+    pwd_hash = bcrypt.hashpw(body.nueva_password.encode(), bcrypt.gensalt()).decode()
+    r = await db["usuarios_master"].update_one({"_id": oid}, {"$set": {"password_hash": pwd_hash}})
+    if r.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    await _audit(db, admin.get("sub", "?"), "cambiar_password_usuario", usuario_id)
+    return {"mensaje": "Contraseña actualizada"}
+
+
+@app.delete("/api/usuarios/{usuario_id}", tags=["Usuarios"])
+async def eliminar_usuario(usuario_id: str, db: AsyncIOMotorDatabase = Depends(get_db),
+                           admin: dict = Depends(_verify_admin)) -> dict[str, str]:
+    try:
+        oid = ObjectId(usuario_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="usuario_id inválido")
+    u = await db["usuarios_master"].find_one({"_id": oid})
+    if not u:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    await db["usuarios_master"].delete_one({"_id": oid})
+    await _audit(db, admin.get("sub", "?"), "eliminar_usuario", u["username"])
+    return {"mensaje": "Usuario eliminado"}
 
 
 # ─────────────────────────────────────────────
@@ -1191,6 +1535,7 @@ def _proyecto_info(p: dict) -> ProyectoInfo:
         git_url=p["git_url"], archivo_principal=p["archivo_principal"],
         archivo_requirements=p["archivo_requirements"], tags=p.get("tags", []),
         env_vars=p.get("env_vars", {}), git_ref=p.get("git_ref"),
+        archivos_adjuntos=p.get("archivos_adjuntos", []),
         fecha_creacion=p["fecha_creacion"],
     )
 
@@ -1205,6 +1550,7 @@ async def crear_proyecto(body: CrearProyectoRequest, db: AsyncIOMotorDatabase = 
         "git_url": body.git_url, "archivo_principal": body.archivo_principal,
         "archivo_requirements": body.archivo_requirements, "tags": body.tags,
         "env_vars": body.env_vars, "git_ref": body.git_ref, "fecha_creacion": ahora,
+        "archivos_adjuntos": [a.model_dump() for a in body.archivos_adjuntos],
     }
     try:
         await db["proyectos"].insert_one(doc)
@@ -1249,10 +1595,13 @@ async def actualizar_proyecto(proyecto_id: str, body: ActualizarProyectoRequest,
     except Exception:
         raise HTTPException(status_code=400, detail="proyecto_id inválido")
     campos: dict[str, Any] = {}
-    for field in ["descripcion", "git_url", "archivo_principal", "archivo_requirements", "tags", "env_vars", "git_ref"]:
+    for field in ["descripcion", "git_url", "archivo_principal", "archivo_requirements", "tags", "env_vars", "git_ref", "archivos_adjuntos"]:
         val = getattr(body, field, None)
         if val is not None:
-            campos[field] = val
+            if field == "archivos_adjuntos":
+                campos[field] = [a.model_dump() if hasattr(a, "model_dump") else a for a in val]
+            else:
+                campos[field] = val
     if not campos:
         raise HTTPException(status_code=400, detail="Nada que actualizar")
     p = await db["proyectos"].find_one_and_update({"_id": oid}, {"$set": campos}, return_document=ReturnDocument.AFTER)
@@ -1316,11 +1665,27 @@ def _tarea_info(t: dict, nombre_proyecto: Optional[str] = None, worker_username:
         reintento_num=t.get("reintento_num", 0), tarea_padre_id=t.get("tarea_padre_id"),
         depende_de=t.get("depende_de", []), git_ref=t.get("git_ref"),
         sla_segundos=t.get("sla_segundos", 0),
+        timeout_segundos=t.get("timeout_segundos", 0),
+        num_archivos_adjuntos=len(t.get("archivos_adjuntos", [])),
         fecha_creacion=t["fecha_creacion"], fecha_inicio=t.get("fecha_inicio"),
         fecha_fin=t.get("fecha_fin"), log_size_bytes=t.get("log_size_bytes", 0),
         ultima_actualizacion_log=t.get("ultima_actualizacion_log"),
         programada_para=t.get("programada_para"),
     )
+
+
+def _combinar_archivos(archivos_proyecto: list, archivos_tarea: list) -> list:
+    """Combina archivos del proyecto + de la tarea. La tarea sobrescribe por (subcarpeta, nombre)."""
+    def _clave(a: dict) -> tuple:
+        return (a.get("subcarpeta", ""), a.get("nombre_archivo", ""))
+    combinado: dict[tuple, dict] = {}
+    for a in (archivos_proyecto or []):
+        d = a if isinstance(a, dict) else a.model_dump()
+        combinado[_clave(d)] = d
+    for a in (archivos_tarea or []):
+        d = a if isinstance(a, dict) else a.model_dump()
+        combinado[_clave(d)] = d  # la tarea pisa al proyecto
+    return list(combinado.values())
 
 
 async def _crear_tarea_doc(db, id_proyecto, worker_id, proyecto, worker, body_dict) -> dict:
@@ -1361,6 +1726,9 @@ async def _crear_tarea_doc(db, id_proyecto, worker_id, proyecto, worker, body_di
         "depende_de": deps, "git_ref": body_dict.get("git_ref"),
         "env_override": body_dict.get("env_override", {}), "sla_segundos": body_dict.get("sla_segundos", 0),
         "sla_alertado": False,
+        "timeout_segundos": body_dict.get("timeout_segundos", 0),
+        "archivos_adjuntos": _combinar_archivos(proyecto.get("archivos_adjuntos", []),
+                                                body_dict.get("archivos_adjuntos", [])),
     }
     await db["tareas"].insert_one(doc)
     if estado_tarea == "ejecutando":
@@ -1910,6 +2278,140 @@ async def eliminar_plantilla(plantilla_id: str, db: AsyncIOMotorDatabase = Depen
 
 
 # ─────────────────────────────────────────────
+# BIBLIOTECA DE ARCHIVOS (configs reutilizables)
+# ─────────────────────────────────────────────
+
+class GuardarArchivoRequest(BaseModel):
+    nombre_logico: str = Field(..., min_length=1, max_length=100, description="Nombre para identificarlo, ej. 'Config prod SIMAT'")
+    nombre_archivo: str = Field(..., min_length=1, max_length=200, description="Nombre del archivo, ej. config.json")
+    contenido: str = Field(default="")
+    encriptado: bool = False
+    es_binario: bool = False
+    subcarpeta: str = Field(default="", max_length=200)
+    descripcion: Optional[str] = Field(default=None, max_length=500)
+    tags: list[str] = Field(default_factory=list)
+
+
+class ActualizarArchivoRequest(BaseModel):
+    nombre_logico: Optional[str] = None
+    nombre_archivo: Optional[str] = None
+    contenido: Optional[str] = None
+    encriptado: Optional[bool] = None
+    es_binario: Optional[bool] = None
+    subcarpeta: Optional[str] = None
+    descripcion: Optional[str] = None
+    tags: Optional[list[str]] = None
+
+
+class ArchivoBibliotecaInfo(BaseModel):
+    id: str
+    nombre_logico: str
+    nombre_archivo: str
+    encriptado: bool
+    es_binario: bool
+    subcarpeta: str
+    descripcion: Optional[str] = None
+    tags: list[str] = []
+    tamano_bytes: int = 0
+    fecha_creacion: str
+    fecha_modificacion: Optional[str] = None
+
+
+def _archivo_info(a: dict, incluir_contenido: bool = False) -> dict:
+    base = {
+        "id": str(a["_id"]), "nombre_logico": a["nombre_logico"], "nombre_archivo": a["nombre_archivo"],
+        "encriptado": a.get("encriptado", False), "es_binario": a.get("es_binario", False),
+        "subcarpeta": a.get("subcarpeta", ""), "descripcion": a.get("descripcion"),
+        "tags": a.get("tags", []), "tamano_bytes": len(a.get("contenido", "") or ""),
+        "fecha_creacion": a["fecha_creacion"], "fecha_modificacion": a.get("fecha_modificacion"),
+    }
+    if incluir_contenido:
+        base["contenido"] = a.get("contenido", "")
+    return base
+
+
+@app.post("/api/archivos", tags=["Biblioteca"])
+async def guardar_archivo(body: GuardarArchivoRequest, db: AsyncIOMotorDatabase = Depends(get_db),
+                          user: dict = Depends(_verify_master)) -> dict[str, Any]:
+    oid = ObjectId()
+    ahora = _now_iso()
+    doc = {
+        "_id": oid, "nombre_logico": body.nombre_logico, "nombre_archivo": body.nombre_archivo,
+        "contenido": body.contenido, "encriptado": body.encriptado, "es_binario": body.es_binario,
+        "subcarpeta": body.subcarpeta, "descripcion": body.descripcion, "tags": body.tags,
+        "fecha_creacion": ahora, "fecha_modificacion": None,
+    }
+    await db["biblioteca_archivos"].insert_one(doc)
+    await _audit(db, user.get("sub", "?"), "guardar_archivo", str(oid), body.nombre_logico)
+    return _archivo_info(doc)
+
+
+@app.get("/api/archivos", tags=["Biblioteca"])
+async def listar_archivos(tag: Optional[str] = Query(default=None),
+                          db: AsyncIOMotorDatabase = Depends(get_db),
+                          _: dict = Depends(_verify_master)) -> list[dict]:
+    filtro: dict = {}
+    if tag:
+        filtro["tags"] = tag
+    out = []
+    async for a in db["biblioteca_archivos"].find(filtro).sort("fecha_creacion", DESCENDING):
+        out.append(_archivo_info(a, incluir_contenido=False))
+    return out
+
+
+@app.get("/api/archivos/{archivo_id}", tags=["Biblioteca"])
+async def detalle_archivo(archivo_id: str, db: AsyncIOMotorDatabase = Depends(get_db),
+                          _: dict = Depends(_verify_master)) -> dict:
+    try:
+        oid = ObjectId(archivo_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="archivo_id inválido")
+    a = await db["biblioteca_archivos"].find_one({"_id": oid})
+    if not a:
+        raise HTTPException(status_code=404, detail="Archivo no encontrado")
+    return _archivo_info(a, incluir_contenido=True)
+
+
+@app.patch("/api/archivos/{archivo_id}", tags=["Biblioteca"])
+async def actualizar_archivo(archivo_id: str, body: ActualizarArchivoRequest,
+                             db: AsyncIOMotorDatabase = Depends(get_db),
+                             user: dict = Depends(_verify_master)) -> dict:
+    try:
+        oid = ObjectId(archivo_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="archivo_id inválido")
+    campos: dict = {}
+    for f in ["nombre_logico", "nombre_archivo", "contenido", "encriptado", "es_binario",
+              "subcarpeta", "descripcion", "tags"]:
+        v = getattr(body, f, None)
+        if v is not None:
+            campos[f] = v
+    if not campos:
+        raise HTTPException(status_code=400, detail="Nada que actualizar")
+    campos["fecha_modificacion"] = _now_iso()
+    a = await db["biblioteca_archivos"].find_one_and_update(
+        {"_id": oid}, {"$set": campos}, return_document=ReturnDocument.AFTER)
+    if not a:
+        raise HTTPException(status_code=404, detail="Archivo no encontrado")
+    await _audit(db, user.get("sub", "?"), "actualizar_archivo", archivo_id)
+    return _archivo_info(a, incluir_contenido=True)
+
+
+@app.delete("/api/archivos/{archivo_id}", tags=["Biblioteca"])
+async def eliminar_archivo(archivo_id: str, db: AsyncIOMotorDatabase = Depends(get_db),
+                           user: dict = Depends(_verify_master)) -> dict[str, str]:
+    try:
+        oid = ObjectId(archivo_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="archivo_id inválido")
+    r = await db["biblioteca_archivos"].delete_one({"_id": oid})
+    if r.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Archivo no encontrado")
+    await _audit(db, user.get("sub", "?"), "eliminar_archivo", archivo_id)
+    return {"mensaje": "Archivo eliminado"}
+
+
+# ─────────────────────────────────────────────
 # NOTIFICACIONES
 # ─────────────────────────────────────────────
 
@@ -2212,6 +2714,8 @@ async def worker_obtener_tarea(db: AsyncIOMotorDatabase = Depends(get_db),
         archivo_requirements=proyecto["archivo_requirements"],
         credenciales_encriptadas=tarea.get("credenciales_encriptadas"),
         env_vars=env_vars,
+        archivos_adjuntos=tarea.get("archivos_adjuntos", []),
+        timeout_segundos=tarea.get("timeout_segundos", 0),
     )
 
 
@@ -2376,5 +2880,19 @@ async def resumen_ejecutivo(db: AsyncIOMotorDatabase = Depends(get_db),
 
 
 @app.get("/health", tags=["Health"])
-async def health_check() -> dict[str, str]:
-    return {"status": "ok", "version": "3.0.0", "timestamp": _now_iso()}
+async def health_check() -> dict[str, Any]:
+    """Verifica que el proceso vive Y que MongoDB responde."""
+    db_ok = False
+    db_error = None
+    try:
+        db = await get_db()
+        await db.command("ping")
+        db_ok = True
+    except Exception as e:
+        db_error = str(e)[:120]
+    estado = "ok" if db_ok else "degraded"
+    resp: dict[str, Any] = {"status": estado, "version": "3.5.0", "timestamp": _now_iso(),
+                            "database": "ok" if db_ok else "unreachable"}
+    if db_error:
+        resp["db_error"] = db_error
+    return resp
