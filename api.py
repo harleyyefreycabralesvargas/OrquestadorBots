@@ -406,24 +406,47 @@ def _enviar_email(destinatarios: list[str], asunto: str, cuerpo: str) -> bool:
 
 
 async def _disparar_webhooks(db: AsyncIOMotorDatabase, evento: str, payload: dict) -> None:
-    """Dispara webhooks + correos para el evento dado."""
+    """Dispara webhooks (con firma HMAC opcional y reintentos acotados) + correos."""
     import httpx
+    import hmac as _hmac
+    import hashlib as _hashlib
     cursor = db["webhooks"].find({"activo": True, "eventos": evento})
     async for wh in cursor:
         url = wh.get("url", "")
-        try:
-            async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT) as client:
-                await client.post(url, json={"evento": evento, "data": payload, "ts": _now_iso()})
-            logger.info(f"Webhook disparado: {evento} → {url}")
-        except Exception as e:
-            logger.warning(f"Webhook falló ({url}): {e}")
+        cuerpo = {"evento": evento, "data": payload, "ts": _now_iso()}
+        cuerpo_bytes = json.dumps(cuerpo, ensure_ascii=False).encode()
+        headers = {"Content-Type": "application/json", "User-Agent": "RPA-Orchestrator-Webhook"}
+        # Firma HMAC-SHA256 si el webhook tiene secreto
+        secreto = wh.get("secreto")
+        if secreto:
+            firma = _hmac.new(secreto.encode(), cuerpo_bytes, _hashlib.sha256).hexdigest()
+            headers["X-RPA-Signature"] = f"sha256={firma}"
+        # Hasta 3 intentos con espera breve (ligero, sin proceso en segundo plano)
+        enviado = False
+        for intento in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT) as client:
+                    resp = await client.post(url, content=cuerpo_bytes, headers=headers)
+                if resp.status_code < 500:
+                    enviado = True
+                    logger.info(f"Webhook disparado: {evento} → {url} ({resp.status_code})")
+                    break
+            except Exception as e:
+                logger.warning(f"Webhook intento {intento+1} falló ({url}): {e}")
+            if intento < 2:
+                await asyncio.sleep(1.5 * (intento + 1))
+        if not enviado:
+            # Registrar fallo (acotado) para diagnóstico, sin reintentar en segundo plano
+            await db["webhooks"].update_one(
+                {"id_webhook": wh["id_webhook"]},
+                {"$set": {"ultimo_fallo": _now_iso()}, "$inc": {"fallos_totales": 1}})
 
     # Correo
     cfg = await _config_global(db)
     if evento in cfg.get("email_eventos", []) and cfg.get("email_alertas"):
         asunto = f"[RPA Orchestrator] {evento}"
-        cuerpo = f"Evento: {evento}\n\n" + "\n".join(f"{k}: {v}" for k, v in payload.items())
-        _enviar_email(cfg["email_alertas"], asunto, cuerpo)
+        cuerpo_mail = f"Evento: {evento}\n\n" + "\n".join(f"{k}: {v}" for k, v in payload.items())
+        _enviar_email(cfg["email_alertas"], asunto, cuerpo_mail)
 
 
 async def _registrar_metrica(db: AsyncIOMotorDatabase, id_proyecto: str, estado_final: str, duracion_seg: float) -> None:
@@ -456,7 +479,8 @@ async def _carga_worker(db: AsyncIOMotorDatabase, worker_id: str) -> int:
 
 async def _mejor_worker(db: AsyncIOMotorDatabase, candidatos_ids: Optional[list[str]] = None) -> Optional[dict]:
     """Selecciona el worker conectado con menor carga. Si candidatos_ids se da, restringe a ese conjunto."""
-    filtro: dict[str, Any] = {"estado": {"$in": ["disponible", "ocupado"]}}
+    filtro: dict[str, Any] = {"estado": {"$in": ["disponible", "ocupado"]},
+                              "en_mantenimiento": {"$ne": True}}  # excluir en mantenimiento
     if candidatos_ids:
         filtro["_id"] = {"$in": [ObjectId(x) for x in candidatos_ids]}
     mejor = None
@@ -521,6 +545,26 @@ async def _procesar_siguiente_tarea(db: AsyncIOMotorDatabase, worker_id: str) ->
         if cola_restante:
             await _procesar_siguiente_tarea(db, worker_id)
         return
+
+    # Límite de concurrencia por proyecto: si el proyecto ya tiene el máximo ejecutándose, esperar
+    proy = await db["proyectos"].find_one({"_id": ObjectId(tarea["id_proyecto"])}, {"max_concurrencia": 1})
+    max_conc = (proy or {}).get("max_concurrencia", 0)
+    if max_conc and max_conc > 0:
+        en_curso = await db["tareas"].count_documents(
+            {"id_proyecto": tarea["id_proyecto"], "estado": "ejecutando"})
+        if en_curso >= max_conc:
+            # rotar la cola: dejar esta para después y probar la siguiente
+            cola_restante = [x for x in cola if x != siguiente_id]
+            if cola_restante:
+                await db["usuarios_worker"].update_one(
+                    {"_id": ObjectId(worker_id)}, {"$pull": {"cola_tareas": siguiente_id}})
+                await db["usuarios_worker"].update_one(
+                    {"_id": ObjectId(worker_id)}, {"$push": {"cola_tareas": siguiente_id}})
+                await _procesar_siguiente_tarea(db, worker_id)
+            else:
+                await db["usuarios_worker"].update_one(
+                    {"_id": ObjectId(worker_id)}, {"$set": {"estado": "disponible", "tarea_actual": None}})
+            return
 
     ahora = _now_iso()
     await db["tareas"].update_one(
@@ -699,6 +743,7 @@ class CrearWorkerRequest(BaseModel):
     pool: Optional[str] = None
 
 class ActualizarWorkerRequest(BaseModel):
+    en_mantenimiento: Optional[bool] = None
     etiqueta: Optional[str] = None
     pool: Optional[str] = None
 
@@ -706,6 +751,7 @@ class CambiarPasswordWorkerRequest(BaseModel):
     nueva_password: str = Field(..., min_length=8)
 
 class WorkerInfo(BaseModel):
+    en_mantenimiento: bool = False  # se rellena vía .get en el serializador
     id: str
     username: str
     estado: str
@@ -760,6 +806,7 @@ class CrearProyectoRequest(BaseModel):
     env_vars: dict[str, str] = Field(default_factory=dict)
     git_ref: Optional[str] = Field(default=None, description="Rama, tag o commit por defecto")
     archivos_adjuntos: list[ArchivoAdjunto] = Field(default_factory=list)
+    max_concurrencia: int = Field(default=0, ge=0, le=50, description="Máx. tareas simultáneas del proyecto (0 = sin límite)")
 
     @field_validator("git_url")
     @classmethod
@@ -778,6 +825,8 @@ class ActualizarProyectoRequest(BaseModel):
     env_vars: Optional[dict[str, str]] = None
     git_ref: Optional[str] = None
     archivos_adjuntos: Optional[list[ArchivoAdjunto]] = None
+    max_concurrencia: Optional[int] = Field(default=None, ge=0, le=50)
+    favorito: Optional[bool] = None
 
     @field_validator("git_url")
     @classmethod
@@ -799,6 +848,8 @@ class ProyectoInfo(BaseModel):
     env_vars: dict[str, str] = {}
     git_ref: Optional[str] = None
     archivos_adjuntos: list[ArchivoAdjunto] = []
+    max_concurrencia: int = 0
+    favorito: bool = False
     fecha_creacion: str
 
 class LanzarTareaRequest(BaseModel):
@@ -943,6 +994,8 @@ class CrearWebhookRequest(BaseModel):
     eventos: list[str]
     descripcion: Optional[str] = None
     activo: bool = True
+    secreto: Optional[str] = Field(default=None, max_length=200,
+                                   description="Si se define, los envíos se firman con HMAC-SHA256 (cabecera X-RPA-Signature)")
 
     @field_validator("url")
     @classmethod
@@ -1339,6 +1392,7 @@ def _worker_info(w: dict) -> WorkerInfo:
         tareas_completadas=w.get("tareas_completadas", 0), tareas_error=w.get("tareas_error", 0),
         cpu_percent=m.get("cpu_percent"), ram_percent=m.get("ram_percent"),
         disk_percent=m.get("disk_percent"),
+        en_mantenimiento=w.get("en_mantenimiento", False),
     )
 
 
@@ -1400,6 +1454,8 @@ async def actualizar_worker(worker_id: str, body: ActualizarWorkerRequest,
         campos["etiqueta"] = body.etiqueta
     if body.pool is not None:
         campos["pool"] = body.pool or None
+    if body.en_mantenimiento is not None:
+        campos["en_mantenimiento"] = body.en_mantenimiento
     if not campos:
         raise HTTPException(status_code=400, detail="Nada que actualizar")
     w = await db["usuarios_worker"].find_one_and_update(
@@ -1536,6 +1592,7 @@ def _proyecto_info(p: dict) -> ProyectoInfo:
         archivo_requirements=p["archivo_requirements"], tags=p.get("tags", []),
         env_vars=p.get("env_vars", {}), git_ref=p.get("git_ref"),
         archivos_adjuntos=p.get("archivos_adjuntos", []),
+        max_concurrencia=p.get("max_concurrencia", 0), favorito=p.get("favorito", False),
         fecha_creacion=p["fecha_creacion"],
     )
 
@@ -1551,6 +1608,7 @@ async def crear_proyecto(body: CrearProyectoRequest, db: AsyncIOMotorDatabase = 
         "archivo_requirements": body.archivo_requirements, "tags": body.tags,
         "env_vars": body.env_vars, "git_ref": body.git_ref, "fecha_creacion": ahora,
         "archivos_adjuntos": [a.model_dump() for a in body.archivos_adjuntos],
+        "max_concurrencia": body.max_concurrencia, "favorito": False,
     }
     try:
         await db["proyectos"].insert_one(doc)
@@ -1595,7 +1653,7 @@ async def actualizar_proyecto(proyecto_id: str, body: ActualizarProyectoRequest,
     except Exception:
         raise HTTPException(status_code=400, detail="proyecto_id inválido")
     campos: dict[str, Any] = {}
-    for field in ["descripcion", "git_url", "archivo_principal", "archivo_requirements", "tags", "env_vars", "git_ref", "archivos_adjuntos"]:
+    for field in ["descripcion", "git_url", "archivo_principal", "archivo_requirements", "tags", "env_vars", "git_ref", "archivos_adjuntos", "max_concurrencia", "favorito"]:
         val = getattr(body, field, None)
         if val is not None:
             if field == "archivos_adjuntos":
@@ -2175,7 +2233,8 @@ async def crear_webhook(body: CrearWebhookRequest, db: AsyncIOMotorDatabase = De
     ahora = _now_iso()
     await db["webhooks"].insert_one({
         "id_webhook": id_webhook, "url": body.url, "eventos": body.eventos,
-        "descripcion": body.descripcion, "activo": body.activo, "fecha_creacion": ahora})
+        "descripcion": body.descripcion, "activo": body.activo, "secreto": body.secreto,
+        "fallos_totales": 0, "ultimo_fallo": None, "fecha_creacion": ahora})
     await _audit(db, user.get("sub", "?"), "crear_webhook", id_webhook, body.url)
     return WebhookInfo(id_webhook=id_webhook, url=body.url, eventos=body.eventos,
                        descripcion=body.descripcion, activo=body.activo, fecha_creacion=ahora)
@@ -2877,6 +2936,165 @@ async def resumen_ejecutivo(db: AsyncIOMotorDatabase = Depends(get_db),
         "notificaciones_no_leidas": await db["notificaciones"].count_documents({"leida": False}),
         "timestamp": _now_iso(),
     }
+
+
+# ─────────────────────────────────────────────
+# COPIA DE SEGURIDAD (export / import de configuración)
+# ─────────────────────────────────────────────
+
+# Colecciones que forman parte de la configuración (NO incluimos tareas/logs/métricas: son históricos pesados)
+_COLECCIONES_BACKUP = ["proyectos", "usuarios_worker", "pools", "plantillas",
+                       "schedules", "webhooks", "biblioteca_archivos", "config_global", "usuarios_master"]
+
+
+def _limpiar_doc(d: dict) -> dict:
+    """Convierte ObjectId a str y deja el documento serializable a JSON."""
+    out = {}
+    for k, v in d.items():
+        if k == "_id":
+            out["_id"] = str(v)
+        elif isinstance(v, ObjectId):
+            out[k] = str(v)
+        elif isinstance(v, datetime):
+            out[k] = v.isoformat()
+        else:
+            out[k] = v
+    return out
+
+
+@app.get("/api/backup/exportar", tags=["Backup"])
+async def exportar_backup(db: AsyncIOMotorDatabase = Depends(get_db),
+                          admin: dict = Depends(_verify_admin)) -> dict[str, Any]:
+    """Exporta toda la configuración a un JSON descargable (sin tareas/logs/métricas)."""
+    data: dict[str, Any] = {
+        "_meta": {"version": "3.7.0", "exportado": _now_iso(),
+                  "por": admin.get("sub", "?"), "colecciones": _COLECCIONES_BACKUP},
+        "datos": {},
+    }
+    total = 0
+    for col in _COLECCIONES_BACKUP:
+        docs = []
+        async for d in db[col].find():
+            docs.append(_limpiar_doc(d))
+        data["datos"][col] = docs
+        total += len(docs)
+    data["_meta"]["total_documentos"] = total
+    await _audit(db, admin.get("sub", "?"), "exportar_backup", "backup", f"{total} documentos")
+    return data
+
+
+class ImportarBackupRequest(BaseModel):
+    datos: dict[str, list]
+    modo: str = Field(default="combinar", description="'combinar' (no borra) o 'reemplazar' (vacía antes)")
+    incluir_usuarios: bool = Field(default=False, description="Si True, también restaura usuarios_master")
+
+
+@app.post("/api/backup/importar", tags=["Backup"])
+async def importar_backup(body: ImportarBackupRequest, db: AsyncIOMotorDatabase = Depends(get_db),
+                          admin: dict = Depends(_verify_admin)) -> dict[str, Any]:
+    """Restaura configuración desde un backup. Modo 'combinar' (upsert) o 'reemplazar'."""
+    if body.modo not in ("combinar", "reemplazar"):
+        raise HTTPException(status_code=400, detail="modo debe ser 'combinar' o 'reemplazar'")
+    resumen: dict[str, int] = {}
+    for col, docs in body.datos.items():
+        if col not in _COLECCIONES_BACKUP:
+            continue
+        if col == "usuarios_master" and not body.incluir_usuarios:
+            continue
+        if not isinstance(docs, list):
+            continue
+        if body.modo == "reemplazar":
+            await db[col].delete_many({})
+        n = 0
+        for d in docs:
+            d = dict(d)
+            _id = d.pop("_id", None)
+            try:
+                oid = ObjectId(_id) if _id else ObjectId()
+            except Exception:
+                oid = ObjectId()
+            try:
+                await db[col].update_one({"_id": oid}, {"$set": d}, upsert=True)
+                n += 1
+            except Exception as e:
+                logger.warning(f"Backup import: no se pudo restaurar doc en {col}: {e}")
+        resumen[col] = n
+    total = sum(resumen.values())
+    await _audit(db, admin.get("sub", "?"), "importar_backup", "backup", f"modo={body.modo}, {total} docs")
+    return {"mensaje": "Backup restaurado", "modo": body.modo, "restaurado": resumen, "total": total}
+
+
+# ─────────────────────────────────────────────
+# VALIDACIÓN PREVIA DE PROYECTO (pre-flight)
+# ─────────────────────────────────────────────
+
+class PreflightRequest(BaseModel):
+    git_url: str
+    archivo_principal: str = "main.py"
+    archivo_requirements: Optional[str] = None
+    git_ref: Optional[str] = None
+
+
+@app.post("/api/proyectos/validar", tags=["Proyectos"])
+async def validar_proyecto(body: PreflightRequest, user: dict = Depends(_verify_master)) -> dict[str, Any]:
+    """Verifica (vía GitHub) que el repo existe y que el archivo principal está presente.
+    Ligero: hasta 2 peticiones HTTP, sin clonar nada."""
+    import httpx
+    import re as _re
+    m = _re.match(r"https://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$", body.git_url.strip())
+    checks: list[dict[str, Any]] = []
+    if not m:
+        return {"ok": False, "checks": [{"item": "URL de GitHub", "ok": False,
+                "detalle": "El formato debe ser https://github.com/usuario/repo"}]}
+    owner, repo = m.group(1), m.group(2)
+    rama = body.git_ref or None
+
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+        # 1) El repositorio existe y es accesible
+        repo_ok = False
+        rama_def = "main"
+        try:
+            r = await client.get(f"https://api.github.com/repos/{owner}/{repo}",
+                                 headers={"Accept": "application/vnd.github+json"})
+            if r.status_code == 200:
+                repo_ok = True
+                rama_def = r.json().get("default_branch", "main")
+                checks.append({"item": "Repositorio", "ok": True, "detalle": f"{owner}/{repo} accesible"})
+            elif r.status_code == 404:
+                checks.append({"item": "Repositorio", "ok": False,
+                               "detalle": "No existe o es privado (debe ser público)"})
+            elif r.status_code == 403:
+                # límite de rate de GitHub: no podemos verificar, pero no es error del usuario
+                checks.append({"item": "Repositorio", "ok": True,
+                               "detalle": "No verificable ahora (límite de GitHub), se asume válido"})
+                repo_ok = True
+            else:
+                checks.append({"item": "Repositorio", "ok": False, "detalle": f"HTTP {r.status_code}"})
+        except Exception as e:
+            checks.append({"item": "Repositorio", "ok": False, "detalle": f"Error de red: {str(e)[:60]}"})
+
+        rama_usar = rama or rama_def
+        # 2) El archivo principal existe en la rama
+        if repo_ok:
+            for archivo, etiqueta, obligatorio in [
+                (body.archivo_principal, "Archivo principal", True),
+                (body.archivo_requirements, "Requirements", False),
+            ]:
+                if not archivo:
+                    continue
+                try:
+                    raw = await client.get(f"https://raw.githubusercontent.com/{owner}/{repo}/{rama_usar}/{archivo}")
+                    if raw.status_code == 200:
+                        checks.append({"item": etiqueta, "ok": True, "detalle": f"{archivo} encontrado"})
+                    else:
+                        checks.append({"item": etiqueta, "ok": (not obligatorio),
+                                       "detalle": f"{archivo} no encontrado en la rama {rama_usar}"
+                                       + ("" if obligatorio else " (opcional)")})
+                except Exception as e:
+                    checks.append({"item": etiqueta, "ok": not obligatorio, "detalle": f"Error: {str(e)[:50]}"})
+
+    ok_global = all(c["ok"] for c in checks)
+    return {"ok": ok_global, "repo": f"{owner}/{repo}", "checks": checks}
 
 
 @app.get("/health", tags=["Health"])
