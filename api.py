@@ -1087,6 +1087,7 @@ class CrearPlantillaRequest(BaseModel):
     git_ref: Optional[str] = None
     sla_segundos: int = Field(default=0, ge=0)
     notas: Optional[str] = None
+    archivos_adjuntos: list[ArchivoAdjunto] = Field(default_factory=list)
 
 class PlantillaInfo(BaseModel):
     id: str
@@ -1100,6 +1101,7 @@ class PlantillaInfo(BaseModel):
     git_ref: Optional[str] = None
     sla_segundos: int = 0
     notas: Optional[str] = None
+    archivos_adjuntos: list[ArchivoAdjunto] = []
     fecha_creacion: str
 
 
@@ -2295,6 +2297,7 @@ async def crear_plantilla(body: CrearPlantillaRequest, db: AsyncIOMotorDatabase 
     doc = {"_id": oid, "nombre": body.nombre, "id_proyecto": str(pid), "pool": body.pool,
            "prioridad": body.prioridad, "max_reintentos": body.max_reintentos, "tags": body.tags,
            "git_ref": body.git_ref, "sla_segundos": body.sla_segundos, "notas": body.notas,
+           "archivos_adjuntos": [a.model_dump() for a in body.archivos_adjuntos],
            "fecha_creacion": ahora}
     try:
         await db["plantillas"].insert_one(doc)
@@ -2304,7 +2307,8 @@ async def crear_plantilla(body: CrearPlantillaRequest, db: AsyncIOMotorDatabase 
     return PlantillaInfo(id=str(oid), nombre=body.nombre, id_proyecto=str(pid),
                          nombre_proyecto=proyecto.get("nombre"), pool=body.pool, prioridad=body.prioridad,
                          max_reintentos=body.max_reintentos, tags=body.tags, git_ref=body.git_ref,
-                         sla_segundos=body.sla_segundos, notas=body.notas, fecha_creacion=ahora)
+                         sla_segundos=body.sla_segundos, notas=body.notas,
+                         archivos_adjuntos=body.archivos_adjuntos, fecha_creacion=ahora)
 
 
 @app.get("/api/plantillas", response_model=list[PlantillaInfo], tags=["Plantillas"])
@@ -2318,6 +2322,7 @@ async def listar_plantillas(db: AsyncIOMotorDatabase = Depends(get_db),
                                  prioridad=t.get("prioridad", 0), max_reintentos=t.get("max_reintentos", 0),
                                  tags=t.get("tags", []), git_ref=t.get("git_ref"),
                                  sla_segundos=t.get("sla_segundos", 0), notas=t.get("notas"),
+                                 archivos_adjuntos=t.get("archivos_adjuntos", []),
                                  fecha_creacion=t["fecha_creacion"]))
     return out
 
@@ -2898,6 +2903,59 @@ async def estado_sistema(db: AsyncIOMotorDatabase = Depends(get_db),
         "notificaciones_no_leidas": await db["notificaciones"].count_documents({"leida": False}),
         "pausa_global": cfg.get("pausa_global", False),
         "timestamp": _now_iso(),
+    }
+
+
+@app.get("/api/sugerencias", tags=["Sistema"])
+async def sugerencias(db: AsyncIOMotorDatabase = Depends(get_db),
+                      _: dict = Depends(_verify_master)) -> dict[str, list]:
+    """Devuelve valores ya usados en la base de datos para autocompletar campos.
+    Ligero: usa distinct() sobre campos indexables, bajo demanda."""
+    def _limpiar(vals, limite=40):
+        out = sorted({str(v).strip() for v in vals if v and str(v).strip()})
+        return out[:limite]
+
+    # Tags de proyectos, tareas y plantillas (unificados)
+    tags = set()
+    for col in ("proyectos", "tareas", "plantillas", "biblioteca_archivos"):
+        try:
+            for t in await db[col].distinct("tags"):
+                if t and str(t).strip():
+                    tags.add(str(t).strip())
+        except Exception:
+            pass
+
+    # Archivos principales y requirements usados en proyectos
+    archivos_principales = await db["proyectos"].distinct("archivo_principal")
+    requirements = await db["proyectos"].distinct("archivo_requirements")
+    git_refs = await db["proyectos"].distinct("git_ref")
+
+    # Nombres de archivos usados (biblioteca + adjuntos de proyectos)
+    nombres_archivos = set(await db["biblioteca_archivos"].distinct("nombre_archivo"))
+    try:
+        async for p in db["proyectos"].find({}, {"archivos_adjuntos.nombre_archivo": 1}):
+            for a in p.get("archivos_adjuntos", []):
+                if a.get("nombre_archivo"):
+                    nombres_archivos.add(a["nombre_archivo"])
+    except Exception:
+        pass
+
+    # Subcarpetas usadas
+    subcarpetas = set()
+    try:
+        for sc in await db["biblioteca_archivos"].distinct("subcarpeta"):
+            if sc and str(sc).strip():
+                subcarpetas.add(str(sc).strip())
+    except Exception:
+        pass
+
+    return {
+        "tags": _limpiar(tags),
+        "archivos_principales": _limpiar(archivos_principales) or ["main.py"],
+        "requirements": _limpiar(requirements) or ["requirements.txt"],
+        "git_refs": _limpiar(git_refs),
+        "nombres_archivos": _limpiar(nombres_archivos),
+        "subcarpetas": _limpiar(subcarpetas),
     }
 
 
