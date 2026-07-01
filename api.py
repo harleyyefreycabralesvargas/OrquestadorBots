@@ -2072,6 +2072,33 @@ def _cron_proxima(cron_expr: str) -> Optional[str]:
         return None
 
 
+class CronPreviewRequest(BaseModel):
+    cron_expr: str
+    n: int = Field(default=5, ge=1, le=10)
+
+
+@app.post("/api/schedules/preview", tags=["Schedules"])
+async def preview_cron(body: CronPreviewRequest, user: dict = Depends(_verify_master)) -> dict[str, Any]:
+    """Devuelve las próximas N ejecuciones de una expresión cron, para validarla antes de guardar."""
+    try:
+        from croniter import croniter
+    except Exception:
+        return {"ok": False, "error": "croniter no disponible en el servidor"}
+    expr = body.cron_expr.strip()
+    if not expr:
+        return {"ok": False, "error": "Indica una expresión cron"}
+    try:
+        base = _now_dt()
+        it = croniter(expr, base)
+        proximas = []
+        for _ in range(body.n):
+            nxt = it.get_next(datetime)
+            proximas.append(nxt.isoformat())
+        return {"ok": True, "cron_expr": expr, "proximas": proximas}
+    except Exception as e:
+        return {"ok": False, "error": f"Expresión cron inválida: {str(e)[:80]}"}
+
+
 @app.post("/api/schedules", response_model=ScheduleInfo, tags=["Schedules"])
 async def crear_schedule(body: CrearScheduleRequest, db: AsyncIOMotorDatabase = Depends(get_db),
                          user: dict = Depends(_verify_master)) -> ScheduleInfo:
@@ -2222,6 +2249,44 @@ async def ejecutar_schedules_pendientes(db: AsyncIOMotorDatabase = Depends(get_d
             errores_lista.append(f"{s['id_schedule']}: {e}")
             logger.error(f"Error en schedule {s['id_schedule']}: {e}")
     return {"tareas_lanzadas": lanzadas, "errores": errores_lista, "timestamp": ahora_iso}
+
+
+@app.post("/api/schedules/{id_schedule}/ejecutar", tags=["Schedules"])
+async def ejecutar_schedule_ahora(id_schedule: str, db: AsyncIOMotorDatabase = Depends(get_db),
+                                  user: dict = Depends(_verify_master)) -> dict[str, Any]:
+    """Lanza inmediatamente una tarea desde un schedule, sin esperar a su próxima ejecución
+    programada (útil para probar o forzar una corrida puntual). No altera el cron."""
+    s = await db["schedules"].find_one({"id_schedule": id_schedule})
+    if not s:
+        raise HTTPException(status_code=404, detail="Schedule no encontrado")
+
+    # Elegir worker: explícito, por pool, o auto (misma lógica que el tick)
+    if s.get("worker_id"):
+        worker = await db["usuarios_worker"].find_one({"_id": ObjectId(s["worker_id"])})
+    elif s.get("pool"):
+        pool = await db["pools"].find_one({"nombre": s["pool"]})
+        worker = await _mejor_worker(db, pool.get("worker_ids", []) if pool else None)
+    else:
+        worker = await _mejor_worker(db)
+
+    if not worker or worker.get("estado") == "desconectado":
+        return {"ok": False, "error": "No hay worker disponible para ejecutar ahora"}
+    proyecto = await db["proyectos"].find_one({"_id": ObjectId(s["id_proyecto"])})
+    if not proyecto:
+        return {"ok": False, "error": "El proyecto del schedule ya no existe"}
+
+    body_dict = {
+        "credenciales_encriptadas": s.get("credenciales_encriptadas"),
+        "prioridad": s.get("prioridad", 0), "tags": s.get("tags", []),
+        "notas": f"Ejecución manual del schedule {id_schedule}",
+        "max_reintentos": s.get("max_reintentos", 0), "depende_de": [],
+        "git_ref": None, "env_override": {}, "sla_segundos": 0,
+    }
+    doc_tarea = await _crear_tarea_doc(db, ObjectId(s["id_proyecto"]), worker["_id"], proyecto, worker, body_dict)
+    id_tarea = doc_tarea.get("id_tarea") if isinstance(doc_tarea, dict) else None
+    await _audit(db, user.get("sub", "?"), "ejecutar_schedule", id_schedule, "ejecución manual")
+    return {"ok": True, "id_tarea": id_tarea, "worker": worker.get("username"),
+            "mensaje": f"Tarea lanzada en {worker.get('username')}"}
 
 
 # ─────────────────────────────────────────────
@@ -3153,6 +3218,89 @@ async def validar_proyecto(body: PreflightRequest, user: dict = Depends(_verify_
 
     ok_global = all(c["ok"] for c in checks)
     return {"ok": ok_global, "repo": f"{owner}/{repo}", "checks": checks}
+
+
+class ArbolRepoRequest(BaseModel):
+    git_url: str
+    git_ref: Optional[str] = None
+
+
+@app.post("/api/proyectos/arbol", tags=["Proyectos"])
+async def arbol_repositorio(body: ArbolRepoRequest, user: dict = Depends(_verify_master)) -> dict[str, Any]:
+    """Escanea el árbol de archivos de un repo público de GitHub (sin clonar) para poder
+    elegir el archivo principal, requirements, etc. desde una lista. Una sola petición HTTP."""
+    import httpx
+    import re as _re
+    m = _re.match(r"https://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$", body.git_url.strip())
+    if not m:
+        return {"ok": False, "error": "El formato debe ser https://github.com/usuario/repo"}
+    owner, repo = m.group(1), m.group(2)
+
+    async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+        # Resolver la rama por defecto si no se indicó una
+        rama = body.git_ref
+        if not rama:
+            try:
+                ri = await client.get(f"https://api.github.com/repos/{owner}/{repo}",
+                                      headers={"Accept": "application/vnd.github+json"})
+                if ri.status_code == 200:
+                    rama = ri.json().get("default_branch", "main")
+                elif ri.status_code == 404:
+                    return {"ok": False, "error": "El repositorio no existe o es privado (debe ser público)"}
+                elif ri.status_code == 403:
+                    return {"ok": False, "error": "Límite de peticiones de GitHub alcanzado. Intenta en unos minutos."}
+                else:
+                    rama = "main"
+            except Exception as e:
+                return {"ok": False, "error": f"Error de red: {str(e)[:60]}"}
+
+        # Obtener el árbol recursivo
+        try:
+            tr = await client.get(
+                f"https://api.github.com/repos/{owner}/{repo}/git/trees/{rama}?recursive=1",
+                headers={"Accept": "application/vnd.github+json"})
+        except Exception as e:
+            return {"ok": False, "error": f"Error de red al leer el árbol: {str(e)[:60]}"}
+
+        if tr.status_code == 404:
+            return {"ok": False, "error": f"No se encontró la rama '{rama}' en el repositorio"}
+        if tr.status_code == 403:
+            return {"ok": False, "error": "Límite de peticiones de GitHub alcanzado. Intenta en unos minutos."}
+        if tr.status_code != 200:
+            return {"ok": False, "error": f"GitHub respondió HTTP {tr.status_code}"}
+
+        data = tr.json()
+        arbol = data.get("tree", [])
+        truncado = data.get("truncated", False)
+
+    # Separar archivos (blob) y carpetas (tree)
+    archivos = sorted(n["path"] for n in arbol if n.get("type") == "blob")
+    carpetas = sorted(n["path"] for n in arbol if n.get("type") == "tree")
+
+    # Candidatos útiles
+    py = [a for a in archivos if a.lower().endswith(".py")]
+    reqs = [a for a in archivos if _re.search(r"(^|/)requirements[^/]*\.txt$", a.lower())
+            or a.lower().endswith("requirements.txt")]
+
+    # Agrupar por carpeta (para mostrar por secciones)
+    por_carpeta: dict[str, list] = {}
+    for a in archivos:
+        carpeta = a.rsplit("/", 1)[0] if "/" in a else "(raíz)"
+        por_carpeta.setdefault(carpeta, []).append(a)
+
+    return {
+        "ok": True,
+        "repo": f"{owner}/{repo}",
+        "rama": rama,
+        "total_archivos": len(archivos),
+        "total_carpetas": len(carpetas),
+        "truncado": truncado,
+        "archivos": archivos[:2000],          # tope defensivo
+        "carpetas": carpetas[:500],
+        "python": py[:500],
+        "requirements": reqs[:50],
+        "por_carpeta": {k: v for k, v in sorted(por_carpeta.items())},
+    }
 
 
 @app.get("/health", tags=["Health"])

@@ -1,0 +1,7 @@
+*.env
+.venv_test/
+__pycache__/
+*.pyc
+.claude/
+dist_interfaz/
+build_tmp/
